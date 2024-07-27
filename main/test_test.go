@@ -1,8 +1,8 @@
 package main
 
 import (
-	"go-app/ecs"
-	"go-app/test"
+	"go-ecs/ecs"
+	"go-ecs/test"
 	"testing"
 	"unsafe"
 )
