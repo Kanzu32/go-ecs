@@ -1,195 +1,285 @@
 package ecs
 
 import (
+	"errors"
 	"fmt"
+	"go-ecs/ecs/parray"
+	"go-ecs/ecs/psize"
 )
 
-// ###
+const maxEntities = 65536
 
-type Component interface {
-	// TODO INIT MAYBE???
+type P = AnyPool
+type AnyPool interface {
+	HasEntity(entity Entity) bool
+	Entities() []Entity
+	EntityCount() int
+	RemoveEntity(entity Entity) error
 }
+
+type Entity struct {
+	state   uint8
+	id      uint16
+	version uint8
+}
+
+func (e *Entity) ID() uint16         { return e.id }
+func (e *Entity) isNil() bool        { return e.state&1 != 0 }
+func (e *Entity) isRegistered() bool { return e.state&2 != 0 }
+func (e *Entity) setNil() {
+	e.state = e.state | 1
+	e.state = e.state &^ 2
+}
+func (e *Entity) setRegistered() {
+	e.state = e.state | 2
+	e.state = e.state &^ 1
+}
+
+func (e *Entity) clear() { e.state = 0 }
+func (e Entity) String() string {
+	if e.isNil() {
+		return fmt.Sprintf("E #%d v%d NIL", e.id, e.version)
+	}
+	if e.isRegistered() {
+		return fmt.Sprintf("E #%d v%d REG", e.id, e.version)
+	}
+	return fmt.Sprintf("Ent #%d v%d ", e.id, e.version)
+}
+
+// func (f *flags) Set(b)      { return b | flag }
+// func (f *flags) Clear(b)    { return b &^ flag }
+// func (f *flags) Toggle(b)   { return b ^ flag }
+// func (f *flags) Has(b) bool { return b&flag != 0 }
 
 // WORLD
 
 type world struct {
-	componentPools []*componentPool
+	pools []AnyPool
 
-	maxEntities int
+	next      uint32   // next available entity ID
+	entities  []Entity // array to mark registred and destroyed entities
+	destroyed Entity   // last entity removed from forld
 }
 
-func CreateWorld(maxEntities int) *world {
+func CreateWorld() *world {
 	w := world{}
-	w.maxEntities = maxEntities
-	w.componentPools = make([]*componentPool, 0)
+	w.pools = make([]AnyPool, 0)
+	w.entities = make([]Entity, maxEntities)
+	e := Entity{}
+	e.setNil()
+	w.destroyed = e
 	return &w
 }
 
-// func (w world) String() string {
-// 	str := ""
-// 	for id, v := range w.componentPools {
-// 		str += fmt.Sprintf("Pool: %d\n%s\n", id, v.String())
-// 	}
-// 	return str
-// }
+func CreateComponentPool[componentType any](w *world, pageSize psize.PageSizes) *componentPool[componentType] {
+	pool := componentPool[componentType]{}
 
-func (w *world) GetPool(poolID int) *componentPool {
-	return w.componentPools[poolID]
+	pool.sparseEntities = parray.CreatePageArray(pageSize)
+	pool.world = w
+	w.pools = append(w.pools, &pool)
+	return &pool
 }
 
-func (w *world) CreateComponentPool(pageSize int) int {
-	pool := componentPool{}
-	pool.sparseEntities = createPageArray(pageSize, w.maxEntities)
-	w.componentPools = append(w.componentPools, &pool)
-	return len(w.componentPools) - 1
+func CreateFlagPool(w *world, pageSize psize.PageSizes) *flagPool {
+	pool := flagPool{}
+
+	pool.sparseEntities = parray.CreatePageArray(pageSize)
+	pool.world = w
+	w.pools = append(w.pools, &pool)
+	return &pool
 }
 
-func Pr(w *world) { // test
-	for _, pool := range w.componentPools {
-		fmt.Println(pool)
+func (w *world) registerNewEntity() (Entity, error) {
+	if w.destroyed.isNil() {
+		if w.next == maxEntities {
+			e := Entity{}
+			e.setNil()
+			return e, errors.New("too many entities")
+		}
+		w.entities[w.next].setRegistered()
+		e := w.entities[w.next]
+		e.id = uint16(w.next)
+		w.next += 1
+		return e, nil
 	}
+
+	ret := w.destroyed
+	w.destroyed = w.entities[ret.id]
+	w.entities[ret.id].setRegistered()
+	ret.setRegistered()
+	ret.version = w.entities[ret.id].version
+	return ret, nil
 }
 
-func (w world) GetEntitiesByFilter(include []int, exclude []int) []int {
-	shortestId := 0
-	shortestLen := len(w.GetEntitiesByComponent(include[0]))
-	res := make([]int, 0)
-	for poolId := range include {
-		if shortestLen > len(w.GetEntitiesByComponent(poolId)) {
-			shortestLen = len(w.GetEntitiesByComponent(poolId))
-			shortestId = poolId
+func (w *world) isRegisteredEntity(entity Entity) bool {
+	return w.entities[entity.id].isRegistered()
+}
+
+func RemoveEntityFromWorld(w *world, entity Entity) {
+	for _, pool := range w.pools {
+		if pool.HasEntity(entity) {
+			pool.RemoveEntity(entity)
 		}
 	}
+	w.entities[entity.id].id = w.destroyed.id
+	w.entities[entity.id].state = w.destroyed.state
+	w.entities[entity.id].version++
+	w.destroyed.id = entity.id
+	w.destroyed.clear()
+}
 
-EntityLoop:
-	for _, entityId := range w.GetEntitiesByComponent(shortestId) {
-		for _, poolId := range include {
-			if !w.GetPool(poolId).HasEntity(entityId) {
-				continue EntityLoop
-			}
-		}
+// COMPONENT POOL
 
-		for _, poolId := range exclude {
-			if w.GetPool(poolId).HasEntity(entityId) {
-				continue EntityLoop
-			}
-		}
+type componentPool[componentType any] struct {
+	denseComponents []componentType
 
-		res = append(res, entityId)
+	denseEntities []Entity
+
+	sparseEntities parray.PageArray
+
+	world *world
+}
+
+func (pool *componentPool[componentType]) AddNewEntity(comp componentType) (Entity, error) {
+	entity, err := pool.world.registerNewEntity()
+	if err != nil {
+		return entity, err
 	}
-
-	return res
+	pool.denseComponents = append(pool.denseComponents, comp)
+	pool.denseEntities = append(pool.denseEntities, entity)
+	pool.sparseEntities.Set(entity.id, len(pool.denseEntities)-1)
+	return entity, nil
 }
 
-func (w world) IsEntityInPool(entityId int, poolId int) bool {
-	return w.GetPool(poolId).sparseEntities.get(entityId) != -1
-}
-
-func (w world) GetEntitiesByComponent(componentId int) []int {
-	return w.GetPool(componentId).denseEntities
-}
-
-// PAGE ARRAY
-
-type pageArray struct {
-	data      [][]int
-	pageSize  int
-	arraySize int
-}
-
-func createPageArray(pageSize int, arraySize int) pageArray {
-	p := pageArray{}
-	p.pageSize = pageSize
-	p.arraySize = arraySize
-	p.data = make([][]int, arraySize/pageSize)
-	return p
-}
-
-func (p pageArray) set(index int, value int) {
-	pageNumber := index / p.pageSize
-	pageIndex := index % p.pageSize
-
-	if p.data[pageNumber] == nil {
-		p.data[pageNumber] = make([]int, p.pageSize)
-
-		p.data[pageNumber][0] = -1
-
-		for j := 1; j < len(p.data[pageNumber]); j *= 2 {
-			copy(p.data[pageNumber][j:], p.data[pageNumber][:j])
-		}
+func (pool *componentPool[componentType]) AddExistingEntity(entity Entity, comp componentType) error {
+	if !pool.world.isRegisteredEntity(entity) {
+		return errors.New("entityID is not registered")
 	}
-
-	p.data[pageNumber][pageIndex] = value
+	pool.denseComponents = append(pool.denseComponents, comp)
+	pool.denseEntities = append(pool.denseEntities, entity)
+	pool.sparseEntities.Set(entity.id, len(pool.denseEntities)-1)
+	return nil
 }
 
-func (p pageArray) get(index int) int {
-	pageNumber := index / p.pageSize
-	pageIndex := index % p.pageSize
+func (pool *componentPool[componentType]) RemoveEntity(entity Entity) error {
+	denseRemoveIndex := pool.sparseEntities.Get(entity.id)                                     // индекс для удаления (замены) элемента в dense массивах
+	sparseLastIndex := pool.denseEntities[len(pool.denseEntities)-1].id                        // индекс элемента в sparse массиве для последнего dense элемента
+	pool.sparseEntities.Set(sparseLastIndex, denseRemoveIndex)                                 // установка нового указателя на dence массив sparce массиве
+	pool.denseEntities[denseRemoveIndex] = pool.denseEntities[len(pool.denseEntities)-1]       // перемещение последнего элемента dense массива
+	pool.denseComponents[denseRemoveIndex] = pool.denseComponents[len(pool.denseComponents)-1] // на позицию удаления для двух массивов
 
-	if p.data[pageNumber] == nil {
-		return -1
-	}
+	pool.sparseEntities.Set(entity.id, -1) // установка sparse эдемента для удаления в -1
 
-	return p.data[pageNumber][pageIndex]
+	// Уменьшение len без удаления последнего элемента.
+	// При необходимости его можно восстановить увиличив len. Append перезапишет скрытый элемент
+	pool.denseComponents = pool.denseComponents[:len(pool.denseComponents)-1]
+	pool.denseEntities = pool.denseEntities[:len(pool.denseEntities)-1]
+	return nil
 }
 
-func (p pageArray) String() string {
-	return fmt.Sprintf("Page size: %d\nArray size: %d\n%v", p.pageSize, p.arraySize, p.data)
+func (pool *componentPool[componentType]) HasEntity(entity Entity) bool {
+	return pool.sparseEntities.Get(entity.id) != -1
 }
 
-// POOL
-
-type componentPool struct {
-	denseComponents []Component
-
-	denseEntities []int
-
-	sparseEntities pageArray
-}
-
-func (pool *componentPool) AddEntity(entityID int, c Component) (int, Component) {
-	pool.denseEntities = append(pool.denseEntities, entityID)
-	pool.denseComponents = append(pool.denseComponents, c)
-	pool.sparseEntities.set(entityID, len(pool.denseEntities)-1)
-	return len(pool.denseEntities) - 1, pool.denseComponents[len(pool.denseComponents)-1]
-}
-
-func (pool componentPool) HasEntity(entityID int) bool {
-	return pool.sparseEntities.get(entityID) != -1
-}
-
-func (pool componentPool) GetEntities() []int {
+func (pool *componentPool[componentType]) Entities() []Entity {
 	return pool.denseEntities
 }
 
-func (pool componentPool) GetComponent(entityID int) Component {
-	return pool.denseComponents[pool.sparseEntities.get(entityID)]
+func (pool *componentPool[componentType]) Component(entity Entity) (*componentType, error) {
+	return &pool.denseComponents[pool.sparseEntities.Get(entity.id)], nil
 }
 
-func (pool componentPool) SetComponent(entityID int, c Component) {
-	pool.denseComponents[pool.sparseEntities.get(entityID)] = c
-}
-
-func (pool componentPool) GetComponents() []Component {
-	return pool.denseComponents
-}
-
-// func (pool componentPool[poolType]) GetDenseEntities() []int {
-// 	return pool.denseEntities
-// }
-
-// func (pool componentPool[poolType]) GetDenseComponents() []poolType {
-// 	return pool.denseComponents
-// }
-
-// func (pool componentPool[poolType]) GetComponentByEntity(entityId int) poolType {
-// 	return pool.denseComponents[entityId]
-// }
-
-func (pool componentPool) EntityCount() int {
+func (pool *componentPool[poolType]) EntityCount() int {
 	return len(pool.denseEntities)
 }
 
-func (pool componentPool) String() string {
+func (pool componentPool[componentType]) String() string {
 	return fmt.Sprintf("Components: %v\nDense ent: %v\nSparse ent:\n%v", pool.denseComponents, pool.denseEntities, pool.sparseEntities.String())
+}
+
+// ENTITY FILTER
+
+func PoolFilter(include []AnyPool, exclude []AnyPool) []Entity {
+	if len(include) == 0 {
+		panic("include can't be empty")
+	}
+	shortestIndex := 0
+	shortestLen := include[0].EntityCount()
+	res := make([]Entity, 0)
+	for i, pool := range include {
+		if shortestLen > pool.EntityCount() {
+			shortestLen = pool.EntityCount()
+			shortestIndex = i
+		}
+	}
+EntityLoop:
+	for _, entity := range include[shortestIndex].Entities() {
+		for _, pool := range include {
+			if !pool.HasEntity(entity) {
+				continue EntityLoop
+			}
+		}
+
+		for _, pool := range exclude {
+			if pool.HasEntity(entity) {
+				continue EntityLoop
+			}
+		}
+
+		res = append(res, entity)
+	}
+	return res
+}
+
+// FLAG POOL
+
+type flagPool struct {
+	denseEntities []Entity
+
+	sparseEntities parray.PageArray
+
+	world *world
+}
+
+func (pool *flagPool) AddNewEntity() (Entity, error) {
+	entity, err := pool.world.registerNewEntity()
+	if err != nil {
+		return entity, err
+	}
+	pool.denseEntities = append(pool.denseEntities, entity)
+	pool.sparseEntities.Set(entity.id, len(pool.denseEntities)-1)
+	return entity, nil
+}
+
+func (pool *flagPool) AddExistingEntity(entity Entity) (Entity, error) {
+	if !pool.world.isRegisteredEntity(entity) {
+		return entity, errors.New("entityID is not registered")
+	}
+	pool.denseEntities = append(pool.denseEntities, entity)
+	pool.sparseEntities.Set(entity.id, len(pool.denseEntities)-1)
+	return entity, nil
+}
+
+func (pool *flagPool) RemoveEntity(entity Entity) error {
+	denseRemoveIndex := pool.sparseEntities.Get(entity.id)
+	sparseLastIndex := pool.denseEntities[len(pool.denseEntities)-1].id
+	pool.sparseEntities.Set(sparseLastIndex, denseRemoveIndex)
+	pool.denseEntities[denseRemoveIndex] = pool.denseEntities[len(pool.denseEntities)-1]
+
+	pool.sparseEntities.Set(entity.id, -1)
+
+	pool.denseEntities = pool.denseEntities[:len(pool.denseEntities)-1]
+	return nil
+}
+
+func (pool *flagPool) HasEntity(entity Entity) bool {
+	return pool.sparseEntities.Get(entity.id) != -1
+}
+
+func (pool *flagPool) Entities() []Entity {
+	return pool.denseEntities
+}
+
+func (pool *flagPool) EntityCount() int {
+	return len(pool.denseEntities)
 }
